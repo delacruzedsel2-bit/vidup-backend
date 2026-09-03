@@ -7,7 +7,7 @@ app.use(cors());
 
 const TMDB_API_KEY = "bc2f6b6e59025240f97d2c70de61d88a";
 
-// --- 1. SINGLETON BROWSER ENGINE ---
+// --- 1. ROBUST BROWSER ENGINE ---
 let globalBrowser = null;
 
 async function getBrowser() {
@@ -15,6 +15,7 @@ async function getBrowser() {
         console.log("[Engine] Launching Singleton Chromium Instance...");
         globalBrowser = await puppeteer.launch({
             headless: "new",
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium', // CRITICAL FIX: Points to Docker's Chrome
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -22,7 +23,6 @@ async function getBrowser() {
                 '--disable-gpu',
                 '--no-zygote',
                 '--single-process',
-                '--disable-accelerated-2d-canvas',
                 '--disable-web-security',
                 '--blink-settings=imagesEnabled=false'
             ]
@@ -31,7 +31,6 @@ async function getBrowser() {
     return globalBrowser;
 }
 
-// Ensure browser is ready on startup
 getBrowser().catch(err => console.error("[Engine] Browser launch error:", err));
 
 // --- 2. MANIFEST ROUTE ---
@@ -39,9 +38,9 @@ function createManifest(config) {
     const addonName = config.name || "VidUpPlay";
     return {
         id: "org.vidup.sniper",
-        version: "2.1.0",
+        version: "3.0.0",
         name: addonName,
-        description: "High-speed stream scraper with custom stream formatters.",
+        description: "Professional multi-quality scraper with header injection.",
         resources: ["stream"],
         types: ["movie", "series"],
         idPrefixes: ["tt", "tmdb:"],
@@ -49,7 +48,9 @@ function createManifest(config) {
     };
 }
 
-app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
+app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+app.get(['/manifest.json', '/:config/manifest.json'], (req, res) => {
     let config = { name: "VidUpPlay" };
     if (req.params.config) {
         try {
@@ -62,7 +63,7 @@ app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
     return res.json(createManifest(config));
 });
 
-// --- 3. HELPER: TMDB ID RESOLVER ---
+// --- 3. TMDB CONVERTER ---
 async function resolveTmdbId(id, type) {
     if (!id.startsWith('tt')) return id.replace('tmdb:', '');
     try {
@@ -77,7 +78,46 @@ async function resolveTmdbId(id, type) {
     return null;
 }
 
-// --- 4. STREAM EXTRACTION (SNIPER) ---
+// --- 4. MASTER PLAYLIST PARSER ---
+async function parseMasterPlaylist(masterUrl) {
+    if (!masterUrl.includes('.m3u8')) {
+        return [{ quality: 'HD', url: masterUrl }];
+    }
+    try {
+        const res = await fetch(masterUrl, {
+            headers: {
+                'Referer': 'https://vidup.to/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        });
+        const text = await res.text();
+        const streams = [];
+        const lines = text.split('\n');
+        let currentQuality = null;
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line.startsWith('#EXT-X-STREAM-INF')) {
+                const resMatch = line.match(/RESOLUTION=\d+x(\d+)/);
+                if (resMatch) currentQuality = resMatch[1] + 'p';
+            } else if (line && !line.startsWith('#') && currentQuality) {
+                let streamUrl = line;
+                if (!streamUrl.startsWith('http')) {
+                    const baseUrl = masterUrl.substring(0, masterUrl.lastIndexOf('/') + 1);
+                    streamUrl = baseUrl + line;
+                }
+                streams.push({ quality: currentQuality, url: streamUrl });
+                currentQuality = null;
+            }
+        }
+        return streams.length > 0 ? streams : [{ quality: 'Auto', url: masterUrl }];
+    } catch (e) {
+        console.error("[Parser] Failed to parse master playlist:", e);
+        return [{ quality: 'Auto', url: masterUrl }];
+    }
+}
+
+// --- 5. STREAM EXTRACTION (SNIPER) ---
 async function scrapeVidup(targetUrl) {
     const browser = await getBrowser();
     const page = await browser.newPage();
@@ -85,24 +125,17 @@ async function scrapeVidup(targetUrl) {
 
     try {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-        await page.setExtraHTTPHeaders({
-            'Referer': 'https://vidup.to/',
-            'Origin': 'https://vidup.to'
-        });
-
+        await page.setExtraHTTPHeaders({ 'Referer': 'https://vidup.to/', 'Origin': 'https://vidup.to' });
         await page.setRequestInterception(true);
 
         const linkPromise = new Promise((resolve) => {
             page.on('request', (req) => {
                 const u = req.url();
                 const type = req.resourceType();
-
-                // Block images and fonts to save memory, allow scripts for decryption
                 if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
                     req.abort();
                 } else {
-                    if ((u.includes('.m3u8') || u.includes('.mp4')) && 
-                        !u.includes('.vtt') && !u.includes('blank') && !u.includes('ad')) {
+                    if ((u.includes('.m3u8') || u.includes('.mp4')) && !u.includes('.vtt') && !u.includes('blank') && !u.includes('ad')) {
                         console.log("[Sniper] Caught Target Stream:", u);
                         resolve(u);
                     }
@@ -111,42 +144,35 @@ async function scrapeVidup(targetUrl) {
             });
         });
 
-        // Navigate without waiting for full media load
         page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 7000 }).catch(() => {});
 
-        // Inject high-frequency play triggers
         page.evaluateOnNewDocument(() => {
-            const timer = setInterval(() => {
-                const btn = document.querySelector('.play-button, .jw-icon-display, .vjs-big-play-button, #player, button');
-                if (btn) btn.click();
-                const v = document.querySelector('video');
-                if (v) v.play().catch(() => {});
-            }, 250);
-            setTimeout(() => clearInterval(timer), 4000);
+            document.addEventListener("DOMContentLoaded", () => {
+                const timer = setInterval(() => {
+                    const btn = document.querySelector('.play-button, .jw-icon-display, .vjs-big-play-button, #player, button');
+                    if (btn) btn.click();
+                    const v = document.querySelector('video');
+                    if (v) v.play().catch(() => {});
+                }, 250);
+                setTimeout(() => clearInterval(timer), 4000);
+            });
         });
 
-        // Race condition: Return as soon as the m3u8 is intercepted (max 5.5s timeout)
         streamUrl = await Promise.race([
             linkPromise,
             new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5500))
         ]);
-
     } catch (err) {
         console.log("[Sniper] Extraction ended:", err.message);
     } finally {
         await page.close().catch(() => {});
     }
-
     return streamUrl;
 }
 
-// --- 5. STREAM ROUTE & FORMATTER ---
+// --- 6. STREAM ROUTE & HEADER INJECTION ---
 app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req, res) => {
-    let config = {
-        nameTemplate: "VidUpPlay",
-        descTemplate: "{stream.resolution} • HLS • VidUp",
-        emojis: true
-    };
+    let config = { nameTemplate: "VidUpPlay", descTemplate: "{stream.resolution} • HLS • PeakStorm", emojis: true };
 
     if (req.params.config) {
         try {
@@ -160,15 +186,11 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
 
     if (type === 'series') {
         const parts = id.split(':');
-        rawId = parts[0];
-        season = parts[1] || 1;
-        episode = parts[2] || 1;
+        rawId = parts[0]; season = parts[1] || 1; episode = parts[2] || 1;
     }
 
     const tmdbId = await resolveTmdbId(rawId, type);
-    if (!tmdbId) {
-        return res.json({ streams: [] });
-    }
+    if (!tmdbId) return res.json({ streams: [] });
 
     const targetUrl = type === 'movie' 
         ? `https://vidup.to/movie/${tmdbId}`
@@ -178,49 +200,52 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
     const rawStreamUrl = await scrapeVidup(targetUrl);
 
     if (rawStreamUrl) {
-        // Detect resolution from CDN pattern (e.g. seg-1-s1080p-v1.mp4)
-        let resTag = "1080p";
-        if (rawStreamUrl.includes('2160p') || rawStreamUrl.includes('4k')) resTag = "4K";
-        else if (rawStreamUrl.includes('720p')) resTag = "720p";
-        else if (rawStreamUrl.includes('480p') || rawStreamUrl.includes('360p')) resTag = "480p";
+        const parsedStreams = await parseMasterPlaylist(rawStreamUrl);
+        
+        const stremioStreams = parsedStreams.map(stream => {
+            const resTag = stream.quality;
+            let streamName = config.nameTemplate || "VidUpPlay";
+            let streamDesc = config.descTemplate || "{stream.resolution} • HLS • PeakStorm";
 
-        // Pengu-style dynamic template parsing
-        let streamName = config.nameTemplate || "VidUpPlay";
-        let streamDesc = config.descTemplate || "{stream.resolution} • HLS";
+            if (config.emojis) {
+                const emojiMap = { "2160p": "❄️ 4K", "1080p": "🧊 1080p", "720p": "🍿 720p", "480p": "📺 480p" };
+                streamName = (emojiMap[resTag] || `🍿 ${resTag}`) + " | " + streamName;
+            }
 
-        if (config.emojis) {
-            const emojiMap = { "4K": "❄️ 4K", "1080p": "🧊 1080p", "720p": "🍿 720p", "480p": "📺 480p" };
-            streamName = (emojiMap[resTag] || resTag) + " | " + streamName;
-        }
+            streamDesc = streamDesc
+                .replace('{stream.resolution}', resTag)
+                .replace('{addon.name}', config.nameTemplate || "VidUpPlay");
 
-        streamDesc = streamDesc
-            .replace('{stream.resolution}', resTag)
-            .replace('{addon.name}', config.nameTemplate || "VidUpPlay");
-
-        const finalPlayUrl = rawStreamUrl + (rawStreamUrl.includes('?') ? '&' : '?') + 'sh_provider=vidup';
-
-        return res.json({
-            streams: [{
+            return {
                 name: streamName,
                 title: streamDesc,
-                url: finalPlayUrl
-            }]
+                url: stream.url,
+                // INJECT HEADERS DIRECTLY INTO THE STREMIO PLAYER
+                behaviorHints: {
+                    notWebReady: true,
+                    proxyHeaders: {
+                        request: {
+                            "Referer": "https://vidup.to/",
+                            "Origin": "https://moon.peakstorm.top",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                        }
+                    }
+                }
+            };
         });
+
+        return res.json({ streams: stremioStreams });
     }
 
     return res.json({ streams: [] });
 });
 
-// --- 6. SELF-PING MECHANISM (PREVENTS SLEEP) ---
+// --- 7. SELF-PING MECHANISM ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`[Server] Live on port ${PORT}`);
-    
-    // Ping self every 10 minutes to stay awake
     setInterval(() => {
         const renderUrl = process.env.RENDER_EXTERNAL_URL;
-        if (renderUrl) {
-            fetch(`${renderUrl}/manifest.json`).catch(() => {});
-        }
+        if (renderUrl) fetch(`${renderUrl}/manifest.json`).catch(() => {});
     }, 10 * 60 * 1000);
 });
