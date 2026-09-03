@@ -5,10 +5,13 @@ const puppeteer = require('puppeteer');
 const app = express();
 app.use(cors());
 
-// Your specific TMDB API key
 const TMDB_API_KEY = "bc2f6b6e59025240f97d2c70de61d88a";
 
-// Base manifest template
+// 0. Health Check Route (Prevents Render from marking deploy as Failed)
+app.get('/', (req, res) => {
+    res.redirect('/manifest.json');
+});
+
 const getManifest = (configParams) => {
     return {
         id: "org.vidup.sniper",
@@ -22,7 +25,7 @@ const getManifest = (configParams) => {
     };
 };
 
-// 1. Handle Configuration Route (Used by your Frontend Settings page)
+// 1. Handle Configuration Route
 app.get(['/:config/manifest.json', '/manifest.json'], (req, res) => {
     try {
         if (req.params.config) {
@@ -49,7 +52,6 @@ async function getTmdbId(imdbId, type) {
 
 // 2. Handle Streams
 app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req, res) => {
-    // Extract User Preferences
     let configParams = { name: "VidUpPlay", emojis: true };
     try {
         if (req.params.config) {
@@ -74,11 +76,9 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
         : `https://vidup.to/tv/${tmdbId}/${season}/${episode}`;
 
     try {
-        // Run the Sniper!
         const extractedUrl = await snipeVideo(targetUrl);
         
         if (extractedUrl) {
-            // APPLY CUSTOM FORMATTING BASED ON URL (e.g. seg-1-s2160p-v1.mp4)
             let resolution = "HD";
             if (extractedUrl.includes('2160p') || extractedUrl.includes('4k')) resolution = "4K";
             else if (extractedUrl.includes('1080p')) resolution = "1080p";
@@ -88,7 +88,6 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
             let streamName = configParams.name || "VidUpPlay";
             let titleStr = "";
             
-            // Emoji Parsing
             if (configParams.emojis) {
                 if (resolution === "4K") titleStr = "❄️ 4K | " + streamName;
                 else if (resolution === "1080p") titleStr = "🧊 1080p | " + streamName;
@@ -111,31 +110,28 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
     res.json({ streams: [] });
 });
 
-// 3. The "SNIPER" Scraper Logic (Optimized for Speed)
+// 3. The "SNIPER" Scraper Logic
 async function snipeVideo(url) {
     const browser = await puppeteer.launch({
-        headless: 'new',
+        headless: true, // Updated for stability
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--blink-settings=imagesEnabled=false' // CRITICAL: Blocks heavy images for instant loading
+            '--blink-settings=imagesEnabled=false'
         ]
     });
     
     const page = await browser.newPage();
     await page.setRequestInterception(true);
 
-    // Create a promise that triggers the exact millisecond the video link is spotted
     const streamPromise = new Promise((resolve) => {
         page.on('request', (req) => {
             const reqUrl = req.url();
-            // Block all CSS, Tracking, and Fonts to prevent Stremio Timeouts
             if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
                 req.abort();
             } else {
-                // Snipe the link!
                 if ((reqUrl.includes('.m3u8') || reqUrl.includes('.mp4')) && 
                     !reqUrl.includes('.vtt') && !reqUrl.includes('ad') && !reqUrl.includes('blank')) {
                     resolve(reqUrl);
@@ -146,10 +142,8 @@ async function snipeVideo(url) {
     });
 
     try {
-        // Only wait for DOM, not the whole network
         page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
         
-        // Aggressively inject the clicker right as the page starts
         page.evaluateOnNewDocument(() => {
             document.addEventListener("DOMContentLoaded", () => {
                 const interval = setInterval(() => {
@@ -161,7 +155,6 @@ async function snipeVideo(url) {
             });
         });
 
-        // Race Condition: Snatch the link before a 7 second timeout occurs
         const finalUrl = await Promise.race([
             streamPromise,
             new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 7000))
@@ -174,4 +167,9 @@ async function snipeVideo(url) {
         await browser.close();
         return null;
     }
-                     }
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
