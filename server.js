@@ -7,24 +7,22 @@ app.use(cors());
 
 const TMDB_API_KEY = "bc2f6b6e59025240f97d2c70de61d88a";
 
-// --- 1. ROBUST BROWSER ENGINE ---
+// --- 1. ROBUST STEALTH BROWSER ENGINE ---
 let globalBrowser = null;
 
 async function getBrowser() {
     if (!globalBrowser || !globalBrowser.isConnected()) {
-        console.log("[Engine] Launching Singleton Chromium Instance...");
+        console.log("[Engine] Launching Stealth Chromium Instance...");
         globalBrowser = await puppeteer.launch({
             headless: "new",
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium', // CRITICAL FIX: Points to Docker's Chrome
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled', // CRITICAL: Bypasses Cloudflare bot detection
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
-                '--no-zygote',
-                '--single-process',
-                '--disable-web-security',
-                '--blink-settings=imagesEnabled=false'
+                '--window-size=1280,720'
             ]
         });
     }
@@ -38,9 +36,9 @@ function createManifest(config) {
     const addonName = config.name || "VidUpPlay";
     return {
         id: "org.vidup.sniper",
-        version: "3.0.0",
+        version: "4.0.0",
         name: addonName,
-        description: "Professional multi-quality scraper with header injection.",
+        description: "Professional multi-quality scraper with header injection & metadata.",
         resources: ["stream"],
         types: ["movie", "series"],
         idPrefixes: ["tt", "tmdb:"],
@@ -78,11 +76,10 @@ async function resolveTmdbId(id, type) {
     return null;
 }
 
-// --- 4. MASTER PLAYLIST PARSER ---
+// --- 4. PROFESSIONAL MASTER PLAYLIST PARSER ---
 async function parseMasterPlaylist(masterUrl) {
-    if (!masterUrl.includes('.m3u8')) {
-        return [{ quality: 'HD', url: masterUrl }];
-    }
+    if (!masterUrl.includes('.m3u8')) return [{ quality: 'Auto', url: masterUrl, size: '' }];
+    
     try {
         const res = await fetch(masterUrl, {
             headers: {
@@ -93,27 +90,46 @@ async function parseMasterPlaylist(masterUrl) {
         const text = await res.text();
         const streams = [];
         const lines = text.split('\n');
+        
         let currentQuality = null;
+        let currentBandwidth = null;
         
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i].trim();
             if (line.startsWith('#EXT-X-STREAM-INF')) {
                 const resMatch = line.match(/RESOLUTION=\d+x(\d+)/);
-                if (resMatch) currentQuality = resMatch[1] + 'p';
+                const bwMatch = line.match(/BANDWIDTH=(\d+)/);
+                
+                if (resMatch) {
+                    currentQuality = resMatch[1] + 'p';
+                    if (currentQuality === '2160p') currentQuality = '4K';
+                }
+                if (bwMatch) currentBandwidth = parseInt(bwMatch[1]);
+                
             } else if (line && !line.startsWith('#') && currentQuality) {
                 let streamUrl = line;
                 if (!streamUrl.startsWith('http')) {
                     const baseUrl = masterUrl.substring(0, masterUrl.lastIndexOf('/') + 1);
                     streamUrl = baseUrl + line;
                 }
-                streams.push({ quality: currentQuality, url: streamUrl });
+                
+                // Estimate file size based on bandwidth (like Pengu/1DM)
+                let sizeStr = "";
+                if (currentBandwidth) {
+                    const sizeMB = (currentBandwidth * 7200) / 8388608; // Roughly a 2-hour movie
+                    if (sizeMB > 1000) sizeStr = `${(sizeMB/1024).toFixed(2)} GB`;
+                    else sizeStr = `${sizeMB.toFixed(0)} MB`;
+                }
+
+                streams.push({ quality: currentQuality, url: streamUrl, size: sizeStr });
                 currentQuality = null;
+                currentBandwidth = null;
             }
         }
-        return streams.length > 0 ? streams : [{ quality: 'Auto', url: masterUrl }];
+        return streams.length > 0 ? streams : [{ quality: 'Auto', url: masterUrl, size: '' }];
     } catch (e) {
-        console.error("[Parser] Failed to parse master playlist:", e);
-        return [{ quality: 'Auto', url: masterUrl }];
+        console.error("[Parser] Failed to parse master playlist:", e.message);
+        return [{ quality: 'Auto', url: masterUrl, size: '' }];
     }
 }
 
@@ -124,6 +140,11 @@ async function scrapeVidup(targetUrl) {
     let streamUrl = null;
 
     try {
+        // Spoof navigator to bypass Cloudflare
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
+
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
         await page.setExtraHTTPHeaders({ 'Referer': 'https://vidup.to/', 'Origin': 'https://vidup.to' });
         await page.setRequestInterception(true);
@@ -131,36 +152,37 @@ async function scrapeVidup(targetUrl) {
         const linkPromise = new Promise((resolve) => {
             page.on('request', (req) => {
                 const u = req.url();
-                const type = req.resourceType();
-                if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
-                    req.abort();
-                } else {
-                    if ((u.includes('.m3u8') || u.includes('.mp4')) && !u.includes('.vtt') && !u.includes('blank') && !u.includes('ad')) {
-                        console.log("[Sniper] Caught Target Stream:", u);
-                        resolve(u);
-                    }
-                    req.continue();
+                // WE NO LONGER ABORT IMAGES OR CSS. Let the page load its encrypted data freely!
+                if ((u.includes('.m3u8') || u.includes('.mp4')) && !u.includes('.vtt') && !u.includes('blank') && !u.includes('ad')) {
+                    console.log("[Sniper] Caught Target Stream:", u);
+                    resolve(u);
                 }
+                req.continue();
             });
         });
 
-        page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 7000 }).catch(() => {});
+        page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 0 }).catch(() => {});
 
+        // Center-screen Auto-clicker
         page.evaluateOnNewDocument(() => {
             document.addEventListener("DOMContentLoaded", () => {
                 const timer = setInterval(() => {
-                    const btn = document.querySelector('.play-button, .jw-icon-display, .vjs-big-play-button, #player, button');
-                    if (btn) btn.click();
+                    // Click the center of the screen to hit the play overlay
+                    const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+                    if (el) el.click();
+                    
+                    // Force the video element
                     const v = document.querySelector('video');
                     if (v) v.play().catch(() => {});
-                }, 250);
-                setTimeout(() => clearInterval(timer), 4000);
+                }, 500);
+                setTimeout(() => clearInterval(timer), 5000);
             });
         });
 
+        // Extended Timeout to allow Render's CPU to process the page
         streamUrl = await Promise.race([
             linkPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5500))
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 7500))
         ]);
     } catch (err) {
         console.log("[Sniper] Extraction ended:", err.message);
@@ -200,27 +222,30 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
     const rawStreamUrl = await scrapeVidup(targetUrl);
 
     if (rawStreamUrl) {
+        // Send the intercepted master link to the Parser
         const parsedStreams = await parseMasterPlaylist(rawStreamUrl);
         
         const stremioStreams = parsedStreams.map(stream => {
             const resTag = stream.quality;
+            const sizeStr = stream.size ? `\n💾 ${stream.size}` : "";
+            
             let streamName = config.nameTemplate || "VidUpPlay";
             let streamDesc = config.descTemplate || "{stream.resolution} • HLS • PeakStorm";
 
             if (config.emojis) {
-                const emojiMap = { "2160p": "❄️ 4K", "1080p": "🧊 1080p", "720p": "🍿 720p", "480p": "📺 480p" };
+                const emojiMap = { "4K": "❄️ 4K", "1080p": "🧊 1080p", "720p": "🍿 720p", "480p": "📺 480p" };
                 streamName = (emojiMap[resTag] || `🍿 ${resTag}`) + " | " + streamName;
             }
 
             streamDesc = streamDesc
                 .replace('{stream.resolution}', resTag)
-                .replace('{addon.name}', config.nameTemplate || "VidUpPlay");
+                .replace('{addon.name}', config.nameTemplate || "VidUpPlay") + sizeStr;
 
             return {
                 name: streamName,
                 title: streamDesc,
                 url: stream.url,
-                // INJECT HEADERS DIRECTLY INTO THE STREMIO PLAYER
+                // PROFESSIONAL INJECTION: Forces Stremio to spoof headers!
                 behaviorHints: {
                     notWebReady: true,
                     proxyHeaders: {
