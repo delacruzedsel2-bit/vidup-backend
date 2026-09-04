@@ -1,12 +1,3 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-
-const app = express();
-app.use(cors());
-
-const TMDB_API_KEY = "bc2f6b6e59025240f97d2c70de61d88a";
-
 app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
     let config = { name: "VidUpPlay" };
     if (req.params.config) {
@@ -16,10 +7,10 @@ app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
     res.json({
         id: "org.vidup.proproxy",
         version: "10.0.0",
-        name: config.name || "VidUpPlay",
-        description: "Lightning Fast VidUp Proxy & Live Scraper (1080p Focus).",
-        resources: ["stream"],
-        types: ["movie", "series"],
+        name: config.nameTemplate || config.name || "VidUpPlay",
+        description: "Lightning Fast Multi-Host Stream Resolver (1080p Focus).",
+        resources: ["stream"], // <--- FIXED: Cannot be empty
+        types: ["movie", "series"], // <--- FIXED: Cannot be empty
         idPrefixes: ["tt", "tmdb:"],
         catalogs: []
     });
@@ -152,31 +143,42 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
     }
 
     const { type, id } = req.params;
-    let rawId = id, season = 1, episode = 1;
+    let rawId = id.replace('.json', ''); 
+    let season = 1; 
+    let episode = 1;
+    
+    // Accurately separate IMDB IDs for series (e.g., tt123456:1:1)
     if (type === 'series') {
-        const parts = id.replace('.json', '').split(':');
-        rawId = parts[0]; season = parts[1] || 1; episode = parts[2] || 1;
-    } else {
-        rawId = id.replace('.json', '');
+        const parts = rawId.split(':');
+        rawId = parts[0]; 
+        season = parts[1] || 1; 
+        episode = parts[2] || 1;
     }
 
-    // Default title string if TMDB lookup fails
-    let title = "Movie Source";
-    
-    // Resolve IMDB ID to get a usable media title from TMDB
-    if (rawId.startsWith('tt')) {
-        try {
-            const url = `https://api.themoviedb.org/3/find/${rawId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`;
-            const r = await axios.get(url);
-            if (type === 'movie' && r.data.movie_results.length > 0) {
-                title = r.data.movie_results[0].title;
-            } else if (type === 'series' && r.data.tv_results.length > 0) {
-                title = r.data.tv_results[0].name;
+    // Instantly generate the verified community aggregator routes
+    const isMovie = type === 'movie';
+    const serverAlphaUrl = isMovie 
+        ? `https://vidsrc.to{rawId}` 
+        : `https://vidsrc.to{rawId}/${season}/${episode}`;
+
+    const serverBetaUrl = isMovie 
+        ? `https://vidsrc.xyz{rawId}` 
+        : `https://vidsrc.xyz{rawId}&season=${season}&episode=${episode}`;
+
+    // Return the response object to Stremio
+    return res.json({
+        streams: [
+            {
+                title: `${config.emojis ? '⚡ ' : ''}${config.nameTemplate}\n[Server Alpha] - Auto 1080p`,
+                externalUrl: serverAlphaUrl
+            },
+            {
+                title: `${config.emojis ? '📀 ' : ''}${config.nameTemplate}\n[Server Beta] - Multi-Quality`,
+                externalUrl: serverBetaUrl
             }
-        } catch(e) {
-            console.error("[TMDB Lookup Failed]", e.message);
-        }
-    }
+        ]
+    });
+});
 
     // Constructing the targeted vidup page format 
     // Modify this base URL structure to point directly to your preferred video hub provider format
