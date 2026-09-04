@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer-core');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 const chromium = require('@sparticuz/chromium');
 
 const app = express();
@@ -8,11 +10,8 @@ app.use(cors());
 
 // --- 1. HELPER: CONVERT IMDB TO TMDB IN REAL-TIME ---
 async function getTmdbId(id) {
-    // If it's already a TMDB ID (numbers only or prefixed), return it
     if (!id.startsWith('tt')) return id.replace('tmdb:', '');
-    
     try {
-        // Utilizing the TMDB API key extracted from your Java App
         const tmdbKey = 'bc2f6b6e59025240f97d2c70de61d88a';
         const res = await fetch(`https://api.themoviedb.org/3/find/${id}?api_key=${tmdbKey}&external_source=imdb_id`);
         const data = await res.json();
@@ -30,9 +29,9 @@ app.get('/:conf?/manifest.json', (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.json({
         id: "org.vidup.proproxy",
-        version: "1.0.1",
+        version: "1.0.2",
         name: "VidUp Play Sniper",
-        description: "Background Sniper for VidUp.to resolving direct HLS streams.",
+        description: "Advanced Background Sniper for VidUp.to resolving direct HLS streams.",
         resources: ["stream"],
         types: ["movie", "series"],
         idPrefixes: ["tt", "tmdb:"],
@@ -50,6 +49,7 @@ async function snipeVidupSource(type, tmdbId, season, episode) {
     let browser = null;
 
     try {
+        // Stealth profile to bypass Cloudflare & Turnstile
         browser = await puppeteer.launch({
             headless: chromium.headless,
             executablePath: await chromium.executablePath(),
@@ -66,43 +66,42 @@ async function snipeVidupSource(type, tmdbId, season, episode) {
 
         const page = await browser.newPage();
         
-        // Block heavy resources to speed up scraping and prevent Render RAM spikes
-        await page.setRequestInterception(true);
-
         return await new Promise((resolve) => {
-            // Failsafe timeout (15 Seconds)
-            const timeout = setTimeout(async () => {
-                console.log('[Sniper] Timeout reached. Source not found.');
-                if (browser) await browser.close();
-                resolve(null);
-            }, 15000);
+            let streamFound = false;
 
-            // Network Sniffer
+            // Increased timeout to 25s (VidUp's "Getting things ready" screen can take 5-10s)
+            const timeout = setTimeout(async () => {
+                if (!streamFound) {
+                    console.log('[Sniper] Timeout reached. Source not found.');
+                    if (browser) await browser.close();
+                    resolve(null);
+                }
+            }, 25000);
+
+            // Passively Sniff Network (No request interception to maintain stealth)
             page.on('request', async (request) => {
                 const reqUrl = request.url();
-                const resourceType = request.resourceType();
 
-                if (['image', 'stylesheet', 'font'].includes(resourceType)) {
-                    request.abort();
-                    return;
-                }
-
-                // Strict Video Link Filter (Includes your Java .mpd/.m3u8 exclusions)
                 if (
                     (reqUrl.includes('.m3u8') || reqUrl.includes('.mpd') || (reqUrl.includes('.mp4') && !reqUrl.includes('seg-') && !reqUrl.includes('segment') && !reqUrl.includes('frag'))) &&
                     !reqUrl.includes('.m4s') && !reqUrl.includes('ad') && !reqUrl.includes('tracking') && !reqUrl.includes('blank') && !reqUrl.includes('favicon') && !reqUrl.includes('.vtt') && !reqUrl.includes('/subs/')
                 ) {
-                    console.log(`[Sniper] SOURCE GRABBED! -> ${reqUrl}`);
-                    clearTimeout(timeout);
-                    if (browser) await browser.close();
-                    resolve(reqUrl);
-                    return;
+                    if (!streamFound) {
+                        streamFound = true;
+                        console.log(`[Sniper] SOURCE GRABBED! -> ${reqUrl}`);
+                        clearTimeout(timeout);
+                        if (browser) await browser.close();
+                        resolve(reqUrl);
+                    }
                 }
-                request.continue();
             });
 
-            // Auto-clicker injection to simulate real user interaction
-            page.on('load', async () => {
+            // Set Referer & User-Agent before navigation
+            page.setExtraHTTPHeaders({ 'Referer': 'https://vidup.to/' });
+            page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+
+            // Navigate and inject clicker once DOM is available
+            page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).then(async () => {
                 try {
                     await page.evaluate(() => {
                         const clickInterval = setInterval(() => {
@@ -110,22 +109,12 @@ async function snipeVidupSource(type, tmdbId, season, episode) {
                             if (v) v.play().catch(() => {});
                             const b = document.querySelector('.play-button, .jw-icon-display, .vjs-big-play-button, #player, .btn-play');
                             if (b) b.click();
-                            document.body.click(); // Fallback trigger
-                        }, 1000);
-                        setTimeout(() => clearInterval(clickInterval), 13000);
+                            document.body.click(); 
+                        }, 800);
+                        setTimeout(() => clearInterval(clickInterval), 15000);
                     });
                 } catch (err) {}
-            });
-
-            // Set Referer & User-Agent
-            page.setExtraHTTPHeaders({ 'Referer': 'https://vidup.to/' });
-            page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-
-            page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {
-                clearTimeout(timeout);
-                if (browser) browser.close();
-                resolve(null);
-            });
+            }).catch(() => {});
         });
     } catch (e) {
         console.error("[Sniper] Error initializing browser:", e);
@@ -142,9 +131,8 @@ app.get('/:conf?/stream/:type/:id.json', async (req, res) => {
 
         let rawId, season, episode;
 
-        // FIXED PARAMETER PARSING
         if (type === 'series') {
-            const parts = idParam.split(':'); // Stremio format: tt1234567:1:2
+            const parts = idParam.split(':');
             rawId = parts[0]; 
             season = parts[1];
             episode = parts[2];
@@ -152,7 +140,6 @@ app.get('/:conf?/stream/:type/:id.json', async (req, res) => {
             rawId = idParam;
         }
 
-        // FETCH TMDB ID
         const tmdbId = await getTmdbId(rawId);
 
         if (!tmdbId) {
