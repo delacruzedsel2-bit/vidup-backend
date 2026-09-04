@@ -89,44 +89,65 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
-// --- 2. FAST HTML REGEX SCRAPER (NO PUPPETEER) ---
+// --- 2. FAST HTML REGEX SCRAPER (WITH IFRAME PIERCING) ---
 async function scrapeVidupFast(targetUrl) {
     try {
         console.log(`[Fast Scraper] Fetching HTML for ${targetUrl}`);
         
         const response = await fetch(targetUrl, {
             headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://vidup.to/"
             },
-            // 15 second timeout for standard fetch
             signal: AbortSignal.timeout(15000) 
         });
 
-        const html = await response.text();
+        if (!response.ok) {
+            console.log(`[Fast Scraper Failed] Server blocked request with status: ${response.status}. (Likely Cloudflare)`);
+            return null;
+        }
 
-        // Regex looks for the CDN m3u8 link directly embedded in the source code
-        const linkRegex = /(https:\/\/[^\s"'<>]+\.m3u8)/i;
-        const match = html.match(linkRegex);
+        let html = await response.text();
+
+        // Check 1: Direct m3u8 in the main HTML
+        let linkRegex = /(https:\/\/[^\s"'<>]+\.m3u8)/i;
+        let match = html.match(linkRegex);
+
+        // Check 2: Embedded Iframe Player (Standard for streaming sites)
+        if (!match) {
+            console.log("[Fast Scraper] Link hidden. Hunting for player iframe...");
+            const iframeRegex = /<iframe[^>]+src="([^"]+)"/i;
+            const iframeMatch = html.match(iframeRegex);
+            
+            if (iframeMatch && iframeMatch[1]) {
+                let iframeUrl = iframeMatch[1];
+                if (iframeUrl.startsWith('//')) iframeUrl = 'https:' + iframeUrl;
+                else if (iframeUrl.startsWith('/')) iframeUrl = 'https://vidup.to' + iframeUrl;
+                
+                console.log(`[Fast Scraper] Piercing Iframe: ${iframeUrl}`);
+                const iframeRes = await fetch(iframeUrl, {
+                    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": targetUrl }
+                });
+                html = await iframeRes.text();
+                match = html.match(linkRegex);
+            }
+        }
 
         if (match && match[1]) {
             let masterUrl = match[1];
             console.log("[Fast Scraper SUCCESS] Found Master URL:", masterUrl);
             
-            // Force it to 1080p if it's pointing to the master playlist
+            // Force 1080p conversion
             if (masterUrl.includes('master.m3u8')) {
                 masterUrl = masterUrl.replace('master.m3u8', 'index-s1080p-v1-a1.m3u8');
             } else if (!masterUrl.includes('1080p')) {
-                // If it's a different index file, manually append the 1080p naming convention
                 masterUrl = masterUrl.substring(0, masterUrl.lastIndexOf('/') + 1) + 'index-s1080p-v1-a1.m3u8';
             }
             
-            console.log("[Fast Scraper] Converted 1080p URL:", masterUrl);
             return masterUrl;
         } else {
-            console.log("[Fast Scraper Failed] No .m3u8 link found in HTML.");
+            console.log("[Fast Scraper Failed] No .m3u8 link found in HTML or Iframes.");
         }
     } catch (e) {
         console.error("[Fast Scraper Error]", e.message);
