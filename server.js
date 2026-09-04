@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -24,32 +25,32 @@ app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
     });
 });
 
-// --- 1. THE PENGU LOCAL PROXY REWRITER ---
+// --- 1. LOCAL PROXY REWRITER ---
 app.get('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No URL provided");
 
     try {
-        const response = await fetch(targetUrl, {
+        const response = await axios.get(targetUrl, {
             headers: {
                 "Referer": "https://vidup.to/",
                 "Origin": "https://vidup.to",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
+            },
+            responseType: targetUrl.includes('.m3u8') ? 'text' : 'arraybuffer'
         });
 
-        res.setHeader('Content-Type', response.headers.get('content-type') || 'application/vnd.apple.mpegurl');
         res.setHeader('Access-Control-Allow-Origin', '*');
 
         if (targetUrl.includes('.m3u8')) {
-            const text = await response.text();
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            const text = response.data;
             const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
             
             const rewritten = text.split('\n').map(line => {
                 let trimmed = line.trim();
                 if (trimmed === '') return line;
 
-                // Audio/Subtitle Playlists
                 if (trimmed.startsWith('#EXT-X-MEDIA') && trimmed.includes('URI="')) {
                     return trimmed.replace(/URI="([^"]+)"/, (match, uri) => {
                         const fullUrl = uri.startsWith('http') ? uri : baseUrl + uri;
@@ -61,11 +62,9 @@ app.get('/proxy', async (req, res) => {
                 
                 const fullUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
                 
-                // Sub-Playlists (.m3u8)
                 if (fullUrl.includes('.m3u8')) {
                     return `${req.protocol}://${req.get('host')}/proxy?url=${encodeURIComponent(fullUrl)}`;
                 } else {
-                    // ACTUAL CHUNKS (.ts / .mp4): Route through STREMIO's LOCAL PROXY
                     try {
                         const chunkUrl = new URL(fullUrl);
                         const d = encodeURIComponent(chunkUrl.origin);
@@ -79,42 +78,33 @@ app.get('/proxy', async (req, res) => {
             
             return res.send(rewritten);
         } else {
-            // Fallback for direct media
-            const arrayBuf = await response.arrayBuffer();
-            return res.send(Buffer.from(arrayBuf));
+            res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
+            return res.send(Buffer.from(response.data));
         }
     } catch (e) {
-        console.error("[Proxy Error]", e);
+        console.error("[Proxy Error]", e.message);
         res.status(500).send("Proxy error");
     }
 });
 
-// --- 2. FAST HTML REGEX SCRAPER (WITH IFRAME PIERCING) ---
+// --- 2. FAST HTML REGEX SCRAPER ---
 async function scrapeVidupFast(targetUrl) {
     try {
         console.log(`[Fast Scraper] Fetching HTML for ${targetUrl}`);
         
-        const response = await fetch(targetUrl, {
+        const response = await axios.get(targetUrl, {
             headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://vidup.to/"
             },
-            signal: AbortSignal.timeout(15000) 
+            timeout: 15000
         });
 
-        if (!response.ok) {
-            console.log(`[Fast Scraper Failed] Server blocked request with status: ${response.status}. (Likely Cloudflare)`);
-            return null;
-        }
-
-        let html = await response.text();
-
-        // Check 1: Direct m3u8 in the main HTML
+        let html = response.data;
         let linkRegex = /(https:\/\/[^\s"'<>]+\.m3u8)/i;
         let match = html.match(linkRegex);
 
-        // Check 2: Embedded Iframe Player (Standard for streaming sites)
         if (!match) {
             console.log("[Fast Scraper] Link hidden. Hunting for player iframe...");
             const iframeRegex = /<iframe[^>]+src="([^"]+)"/i;
@@ -126,10 +116,10 @@ async function scrapeVidupFast(targetUrl) {
                 else if (iframeUrl.startsWith('/')) iframeUrl = 'https://vidup.to' + iframeUrl;
                 
                 console.log(`[Fast Scraper] Piercing Iframe: ${iframeUrl}`);
-                const iframeRes = await fetch(iframeUrl, {
+                const iframeRes = await axios.get(iframeUrl, {
                     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": targetUrl }
                 });
-                html = await iframeRes.text();
+                html = iframeRes.data;
                 match = html.match(linkRegex);
             }
         }
@@ -138,7 +128,6 @@ async function scrapeVidupFast(targetUrl) {
             let masterUrl = match[1];
             console.log("[Fast Scraper SUCCESS] Found Master URL:", masterUrl);
             
-            // Force 1080p conversion
             if (masterUrl.includes('master.m3u8')) {
                 masterUrl = masterUrl.replace('master.m3u8', 'index-s1080p-v1-a1.m3u8');
             } else if (!masterUrl.includes('1080p')) {
@@ -165,46 +154,53 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
     const { type, id } = req.params;
     let rawId = id, season = 1, episode = 1;
     if (type === 'series') {
-        const parts = id.split(':');
+        const parts = id.replace('.json', '').split(':');
         rawId = parts[0]; season = parts[1] || 1; episode = parts[2] || 1;
+    } else {
+        rawId = id.replace('.json', '');
     }
 
-    let tmdbId = rawId;
+    // Default title string if TMDB lookup fails
+    let title = "Movie Source";
+    
+    // Resolve IMDB ID to get a usable media title from TMDB
     if (rawId.startsWith('tt')) {
         try {
             const url = `https://api.themoviedb.org/3/find/${rawId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`;
-            const r = await fetch(url);
-            const data = await r.json();
-            if (type === 'movie' && data.movie_results?.length > 0) tmdbId = data.movie_results[0].id;
-            else if (type === 'series' && data.tv_results?.length > 0) tmdbId = data.tv_results[0].id;
-        } catch(e){}
+            const r = await axios.get(url);
+            if (type === 'movie' && r.data.movie_results.length > 0) {
+                title = r.data.movie_results[0].title;
+            } else if (type === 'series' && r.data.tv_results.length > 0) {
+                title = r.data.tv_results[0].name;
+            }
+        } catch(e) {
+            console.error("[TMDB Lookup Failed]", e.message);
+        }
     }
 
-    const targetUrl = type === 'movie' ? `https://vidup.to/movie/${tmdbId}` : `https://vidup.to/tv/${tmdbId}/${season}/${episode}`;
-    
-    // Call the new lightning-fast regex scraper
-    const rawStreamUrl = await scrapeVidupFast(targetUrl);
-    
-    if (rawStreamUrl) {
-        const proxyHostUrl = req.protocol + '://' + req.get('host');
-        
-        // Pass the forced 1080p playlist to the proxy
-        const proxiedUrl = `${proxyHostUrl}/proxy?url=${encodeURIComponent(rawStreamUrl)}`;
-        
-        let streamName = config.nameTemplate || "VidUpPlay";
-        streamName = config.emojis ? `🧊 1080p | ${streamName}` : `1080p | ${streamName}`;
+    // Constructing the targeted vidup page format 
+    // Modify this base URL structure to point directly to your preferred video hub provider format
+    const searchSlug = encodeURIComponent(title.toLowerCase().replace(/[^a-z0-9]+/g, '-'));
+    const targetVidupUrl = type === 'movie' 
+        ? `https://vidup.to{searchSlug}.html` 
+        : `https://vidup.to{searchSlug}-s${season}e${episode}.html`;
 
-        return res.json({ 
+    const m3u8Link = await scrapeVidupFast(targetVidupUrl);
+
+    if (m3u8Link) {
+        // Wrap found link inside your own proxy path to attach headers dynamically
+        const proxyStreamUrl = `${req.protocol}://${req.get('host')}/proxy?url=${encodeURIComponent(m3u8Link)}`;
+        
+        return res.json({
             streams: [{
-                name: streamName,
-                title: `1080p • Pengu.uk Method\n🌐 Source: PeakStorm (Fast Scrape)`,
-                url: proxiedUrl
-            }] 
+                title: `${config.emojis ? '⚡ ' : ''}${config.nameTemplate}\n1080p - Direct Stream`,
+                url: proxyStreamUrl
+            }]
         });
     }
 
     return res.json({ streams: [] });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Server] Live on port ${PORT}`));
+const port = process.env.PORT || 7000;
+app.listen(port, () => console.log(`Server listening on port ${port}`));
