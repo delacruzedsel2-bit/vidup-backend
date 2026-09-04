@@ -35,7 +35,7 @@ app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
         id: "org.vidup.proproxy",
         version: "10.0.0",
         name: config.name || "VidUpPlay",
-        description: "Ultimate Pengu-Style Stremio Proxy & Live Scraper (1080p Only).",
+        description: "Ultimate Pengu-Style Stremio Proxy & Live Scraper.",
         resources: ["stream"],
         types: ["movie", "series"],
         idPrefixes: ["tt", "tmdb:"],
@@ -68,6 +68,7 @@ app.get('/proxy', async (req, res) => {
                 let trimmed = line.trim();
                 if (trimmed === '') return line;
 
+                // 1. Audio/Subtitle Playlists
                 if (trimmed.startsWith('#EXT-X-MEDIA') && trimmed.includes('URI="')) {
                     return trimmed.replace(/URI="([^"]+)"/, (match, uri) => {
                         const fullUrl = uri.startsWith('http') ? uri : baseUrl + uri;
@@ -79,9 +80,11 @@ app.get('/proxy', async (req, res) => {
                 
                 const fullUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
                 
+                // 2. Sub-Playlists (.m3u8)
                 if (fullUrl.includes('.m3u8')) {
                     return `${req.protocol}://${req.get('host')}/proxy?url=${encodeURIComponent(fullUrl)}`;
                 } else {
+                    // 3. ACTUAL CHUNKS (.ts / .mp4): Route through STREMIO's LOCAL PROXY
                     try {
                         const chunkUrl = new URL(fullUrl);
                         const d = encodeURIComponent(chunkUrl.origin);
@@ -95,6 +98,7 @@ app.get('/proxy', async (req, res) => {
             
             return res.send(rewritten);
         } else {
+            // Fallback for direct media
             const arrayBuf = await response.arrayBuffer();
             return res.send(Buffer.from(arrayBuf));
         }
@@ -104,40 +108,7 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
-// --- 3. EXTRACT 1080P FROM MASTER PLAYLIST ---
-async function extract1080p(masterUrl, proxyHostUrl) {
-    // If the sniper already caught the direct 1080p link, just proxy it
-    if (masterUrl.includes('1080p')) {
-        return `${proxyHostUrl}/proxy?url=${encodeURIComponent(masterUrl)}`;
-    }
-
-    // Otherwise, fetch the master playlist and find the 1080p variant
-    try {
-        const res = await fetch(masterUrl, { headers: { 'Referer': 'https://vidup.to/', 'User-Agent': 'Mozilla/5.0' } });
-        const text = await res.text();
-        const lines = text.split('\n');
-        
-        let found1080p = false;
-        
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-            if (line.includes('RESOLUTION=1920x1080') || line.includes('1080p')) {
-                found1080p = true;
-            } else if (found1080p && line && !line.startsWith('#')) {
-                let streamUrl = line.startsWith('http') ? line : masterUrl.substring(0, masterUrl.lastIndexOf('/') + 1) + line;
-                console.log("[Extraction SUCCESS] Found 1080p inside master:", streamUrl);
-                return `${proxyHostUrl}/proxy?url=${encodeURIComponent(streamUrl)}`;
-            }
-        }
-        
-        // Fallback: If no 1080p found, just return the proxied master
-        return `${proxyHostUrl}/proxy?url=${encodeURIComponent(masterUrl)}`;
-    } catch (e) {
-        return `${proxyHostUrl}/proxy?url=${encodeURIComponent(masterUrl)}`;
-    }
-}
-
-// --- 4. ULTIMATE LIVE STEALTH SCRAPER (1080P HUNTER) ---
+// --- 3. PASSIVE BACKGROUND SNIPER (1DM STYLE) ---
 async function scrapeVidup(targetUrl) {
     const browser = await getBrowser();
     const page = await browser.newPage();
@@ -148,50 +119,35 @@ async function scrapeVidup(targetUrl) {
         await page.setRequestInterception(true);
         
         const linkPromise = new Promise((resolve) => {
-            let fallbackMaster = null;
-            
             page.on('request', (req) => {
                 const u = req.url();
                 const type = req.resourceType();
                 
-                // Save RAM on Render by blocking visuals
+                // Save RAM on Render by blocking heavy visual assets
                 if (['image', 'stylesheet', 'font'].includes(type)) {
                     req.abort();
                     return;
                 }
 
-                if (u.includes('.m3u8') && !u.includes('.vtt') && !u.includes('blank') && !u.includes('ad')) {
-                    if (u.includes('1080p')) {
-                        console.log("[Sniper SUCCESS] 1080p directly captured:", u);
-                        resolve(u); // Instantly resolve with 1080p link
-                    } else if (!fallbackMaster) {
-                        fallbackMaster = u; // Save master playlist just in case
-                        // Wait 3 seconds to see if a direct 1080p request follows, otherwise resolve with master
-                        setTimeout(() => resolve(fallbackMaster), 3000); 
-                    }
+                // Passive check: Only grab the specific 1080p playlist URL
+                if (u.includes('1080p') && u.includes('.m3u8')) {
+                    console.log("[Sniper SUCCESS] 1080p Background link captured:", u);
+                    resolve(u);
                 }
+                
                 req.continue();
             });
         });
 
-        console.log(`[Sniper] Navigating to ${targetUrl}`);
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        console.log(`[Sniper] Navigating passively to ${targetUrl}`);
+        // Load the page and let the site's internal player pre-fetch the playlists automatically
+        page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
-        // Get viewport size for center-clicking
-        const { width, height } = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
-        
-        // Brute-Force Hardware Clicker: Clicks the center of the screen every 1.5 seconds.
-        // This is necessary to bypass the "Getting things ready" screen and initiate the player network requests.
-        const clickInterval = setInterval(async () => {
-            try { await page.mouse.click(width / 2, height / 2); } catch(e) {}
-        }, 1500);
-
+        // Wait up to 30 seconds for the network to sniff the 1080p link
         streamUrl = await Promise.race([
             linkPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 25000))
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 30000))
         ]);
-
-        clearInterval(clickInterval); // Clean up the interval
 
     } catch (err) {
         console.log("[Sniper Error]", err.message);
@@ -202,7 +158,7 @@ async function scrapeVidup(targetUrl) {
     return streamUrl;
 }
 
-// --- 5. STREAM GENERATION ROUTE ---
+// --- 4. STREAM GENERATION ROUTE ---
 app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req, res) => {
     let config = { nameTemplate: "VidUpPlay", emojis: true };
     if (req.params.config) {
@@ -230,24 +186,24 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
     const targetUrl = type === 'movie' ? `https://vidup.to/movie/${tmdbId}` : `https://vidup.to/tv/${tmdbId}/${season}/${episode}`;
     console.log(`[Scraping] ${targetUrl}`);
     
+    // Live grab only the 1080p target
     const rawStreamUrl = await scrapeVidup(targetUrl);
     
     if (rawStreamUrl) {
         const proxyHostUrl = req.protocol + '://' + req.get('host');
         
-        // This function guarantees we extract the 1080p URL, or proxy the direct 1080p URL
-        const final1080pUrl = await extract1080p(rawStreamUrl, proxyHostUrl);
+        // Pass the exact 1080p playlist straight to the proxy
+        const proxiedUrl = `${proxyHostUrl}/proxy?url=${encodeURIComponent(rawStreamUrl)}`;
         
         let streamName = config.nameTemplate || "VidUpPlay";
         streamName = config.emojis ? `🧊 1080p | ${streamName}` : `1080p | ${streamName}`;
 
-        // Return ONLY ONE stream array item: the 1080p stream
         return res.json({ 
             streams: [{
                 name: streamName,
-                title: `1080p • Pengu.uk Method\n🌐 Source: PeakStorm (Live)`,
-                url: final1080pUrl
-            }]
+                title: `1080p • Pengu.uk Method\n🌐 Source: PeakStorm (Auto-Sniped)`,
+                url: proxiedUrl
+            }] 
         });
     }
 
