@@ -1,36 +1,10 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
-puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(cors());
 
 const TMDB_API_KEY = "bc2f6b6e59025240f97d2c70de61d88a";
-
-// --- 1. STEALTH BROWSER ENGINE ---
-let globalBrowser = null;
-async function getBrowser() {
-    if (!globalBrowser || !globalBrowser.isConnected()) {
-        console.log("[Engine] Launching Stealth Chromium...");
-        globalBrowser = await puppeteer.launch({
-            headless: "new",
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', 
-                '--disable-gpu', 
-                '--disable-web-security',
-                '--mute-audio' // Required to allow auto-play policies in background
-            ]
-        });
-    }
-    return globalBrowser;
-}
-getBrowser().catch(err => console.error(err));
 
 app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
     let config = { name: "VidUpPlay" };
@@ -42,7 +16,7 @@ app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
         id: "org.vidup.proproxy",
         version: "10.0.0",
         name: config.name || "VidUpPlay",
-        description: "Ultimate Pengu-Style Stremio Proxy & Live Scraper.",
+        description: "Lightning Fast VidUp Proxy & Live Scraper (1080p Focus).",
         resources: ["stream"],
         types: ["movie", "series"],
         idPrefixes: ["tt", "tmdb:"],
@@ -50,7 +24,7 @@ app.get(['/', '/manifest.json', '/:config/manifest.json'], (req, res) => {
     });
 });
 
-// --- 2. THE PENGU LOCAL PROXY REWRITER ---
+// --- 1. THE PENGU LOCAL PROXY REWRITER ---
 app.get('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No URL provided");
@@ -75,7 +49,7 @@ app.get('/proxy', async (req, res) => {
                 let trimmed = line.trim();
                 if (trimmed === '') return line;
 
-                // 1. Audio/Subtitle Playlists
+                // Audio/Subtitle Playlists
                 if (trimmed.startsWith('#EXT-X-MEDIA') && trimmed.includes('URI="')) {
                     return trimmed.replace(/URI="([^"]+)"/, (match, uri) => {
                         const fullUrl = uri.startsWith('http') ? uri : baseUrl + uri;
@@ -87,11 +61,11 @@ app.get('/proxy', async (req, res) => {
                 
                 const fullUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
                 
-                // 2. Sub-Playlists (.m3u8)
+                // Sub-Playlists (.m3u8)
                 if (fullUrl.includes('.m3u8')) {
                     return `${req.protocol}://${req.get('host')}/proxy?url=${encodeURIComponent(fullUrl)}`;
                 } else {
-                    // 3. ACTUAL CHUNKS (.ts / .mp4): Route through STREMIO's LOCAL PROXY
+                    // ACTUAL CHUNKS (.ts / .mp4): Route through STREMIO's LOCAL PROXY
                     try {
                         const chunkUrl = new URL(fullUrl);
                         const d = encodeURIComponent(chunkUrl.origin);
@@ -115,79 +89,52 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
-// --- 3. PASSIVE BACKGROUND SNIPER (MOBILE 1080p FOCUS) ---
-async function scrapeVidup(targetUrl) {
-    const browser = await getBrowser();
-    const page = await browser.newPage();
-    let streamUrl = null;
-
+// --- 2. FAST HTML REGEX SCRAPER (NO PUPPETEER) ---
+async function scrapeVidupFast(targetUrl) {
     try {
-        // MATCH THE VIDEO'S MOBILE ENVIRONMENT EXACTLY
-        await page.setUserAgent('Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36');
-        await page.setViewport({ width: 393, height: 851, isMobile: true, hasTouch: true });
+        console.log(`[Fast Scraper] Fetching HTML for ${targetUrl}`);
         
-        await page.setRequestInterception(true);
-        
-        const linkPromise = new Promise((resolve) => {
-            page.on('request', (req) => {
-                const u = req.url();
-                
-                // We do NOT block images/css anymore so the preloader finishes naturally.
-                // We only block obvious ad-tracking to save RAM.
-                if (u.includes('doubleclick') || u.includes('googlesyndication') || u.includes('analytics')) {
-                    req.abort();
-                    return;
-                }
-
-                // Passive check: Grab the specific 1080p playlist URL
-                if (u.includes('.m3u8') && u.includes('1080p')) {
-                    console.log("[Sniper SUCCESS] 1080p Background link captured:", u);
-                    resolve(u);
-                }
-                
-                req.continue();
-            });
+        const response = await fetch(targetUrl, {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Referer": "https://vidup.to/"
+            },
+            // 15 second timeout for standard fetch
+            signal: AbortSignal.timeout(15000) 
         });
 
-        // INJECT: Auto-trigger the video player natively via DOM (No mouse hardware clicks)
-        await page.evaluateOnNewDocument(() => {
-            document.addEventListener("DOMContentLoaded", () => {
-                const triggerPlayer = setInterval(() => {
-                    // Emulate a standard screen tap in the center where the play button lives
-                    const centerEl = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
-                    if (centerEl && centerEl.click) centerEl.click();
-                    
-                    // Force any video tags to initialize network requests
-                    document.querySelectorAll('video').forEach(v => {
-                        v.muted = true;
-                        v.play().catch(() => {});
-                    });
-                }, 1000);
-                
-                // Stop tapping after 20 seconds
-                setTimeout(() => clearInterval(triggerPlayer), 20000);
-            });
-        });
+        const html = await response.text();
 
-        console.log(`[Sniper] Navigating mobile view to ${targetUrl}`);
-        page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        // Regex looks for the CDN m3u8 link directly embedded in the source code
+        const linkRegex = /(https:\/\/[^\s"'<>]+\.m3u8)/i;
+        const match = html.match(linkRegex);
 
-        // Wait up to 25 seconds for the network to sniff the 1080p link
-        streamUrl = await Promise.race([
-            linkPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 25000))
-        ]);
-
-    } catch (err) {
-        console.log("[Sniper Error]", err.message);
-    } finally {
-        await page.close().catch(() => {});
+        if (match && match[1]) {
+            let masterUrl = match[1];
+            console.log("[Fast Scraper SUCCESS] Found Master URL:", masterUrl);
+            
+            // Force it to 1080p if it's pointing to the master playlist
+            if (masterUrl.includes('master.m3u8')) {
+                masterUrl = masterUrl.replace('master.m3u8', 'index-s1080p-v1-a1.m3u8');
+            } else if (!masterUrl.includes('1080p')) {
+                // If it's a different index file, manually append the 1080p naming convention
+                masterUrl = masterUrl.substring(0, masterUrl.lastIndexOf('/') + 1) + 'index-s1080p-v1-a1.m3u8';
+            }
+            
+            console.log("[Fast Scraper] Converted 1080p URL:", masterUrl);
+            return masterUrl;
+        } else {
+            console.log("[Fast Scraper Failed] No .m3u8 link found in HTML.");
+        }
+    } catch (e) {
+        console.error("[Fast Scraper Error]", e.message);
     }
-    
-    return streamUrl;
+    return null;
 }
 
-// --- 4. STREAM GENERATION ROUTE ---
+// --- 3. STREAM GENERATION ROUTE ---
 app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req, res) => {
     let config = { nameTemplate: "VidUpPlay", emojis: true };
     if (req.params.config) {
@@ -213,15 +160,14 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
     }
 
     const targetUrl = type === 'movie' ? `https://vidup.to/movie/${tmdbId}` : `https://vidup.to/tv/${tmdbId}/${season}/${episode}`;
-    console.log(`[Scraping] ${targetUrl}`);
     
-    // Live grab only the 1080p target
-    const rawStreamUrl = await scrapeVidup(targetUrl);
+    // Call the new lightning-fast regex scraper
+    const rawStreamUrl = await scrapeVidupFast(targetUrl);
     
     if (rawStreamUrl) {
         const proxyHostUrl = req.protocol + '://' + req.get('host');
         
-        // Pass the exact 1080p playlist straight to the proxy
+        // Pass the forced 1080p playlist to the proxy
         const proxiedUrl = `${proxyHostUrl}/proxy?url=${encodeURIComponent(rawStreamUrl)}`;
         
         let streamName = config.nameTemplate || "VidUpPlay";
@@ -230,7 +176,7 @@ app.get(['/stream/:type/:id.json', '/:config/stream/:type/:id.json'], async (req
         return res.json({ 
             streams: [{
                 name: streamName,
-                title: `1080p • Pengu.uk Method\n🌐 Source: PeakStorm (Auto-Sniped)`,
+                title: `1080p • Pengu.uk Method\n🌐 Source: PeakStorm (Fast Scrape)`,
                 url: proxiedUrl
             }] 
         });
