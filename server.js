@@ -18,7 +18,14 @@ async function getBrowser() {
         globalBrowser = await puppeteer.launch({
             headless: "new",
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-web-security']
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage', 
+                '--disable-gpu', 
+                '--disable-web-security',
+                '--mute-audio' // Required to allow auto-play policies in background
+            ]
         });
     }
     return globalBrowser;
@@ -108,29 +115,32 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
-// --- 3. PASSIVE BACKGROUND SNIPER (1DM STYLE) ---
+// --- 3. PASSIVE BACKGROUND SNIPER (MOBILE 1080p FOCUS) ---
 async function scrapeVidup(targetUrl) {
     const browser = await getBrowser();
     const page = await browser.newPage();
     let streamUrl = null;
 
     try {
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+        // MATCH THE VIDEO'S MOBILE ENVIRONMENT EXACTLY
+        await page.setUserAgent('Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36');
+        await page.setViewport({ width: 393, height: 851, isMobile: true, hasTouch: true });
+        
         await page.setRequestInterception(true);
         
         const linkPromise = new Promise((resolve) => {
             page.on('request', (req) => {
                 const u = req.url();
-                const type = req.resourceType();
                 
-                // Save RAM on Render by blocking heavy visual assets
-                if (['image', 'stylesheet', 'font'].includes(type)) {
+                // We do NOT block images/css anymore so the preloader finishes naturally.
+                // We only block obvious ad-tracking to save RAM.
+                if (u.includes('doubleclick') || u.includes('googlesyndication') || u.includes('analytics')) {
                     req.abort();
                     return;
                 }
 
-                // Passive check: Only grab the specific 1080p playlist URL
-                if (u.includes('1080p') && u.includes('.m3u8')) {
+                // Passive check: Grab the specific 1080p playlist URL
+                if (u.includes('.m3u8') && u.includes('1080p')) {
                     console.log("[Sniper SUCCESS] 1080p Background link captured:", u);
                     resolve(u);
                 }
@@ -139,14 +149,33 @@ async function scrapeVidup(targetUrl) {
             });
         });
 
-        console.log(`[Sniper] Navigating passively to ${targetUrl}`);
-        // Load the page and let the site's internal player pre-fetch the playlists automatically
+        // INJECT: Auto-trigger the video player natively via DOM (No mouse hardware clicks)
+        await page.evaluateOnNewDocument(() => {
+            document.addEventListener("DOMContentLoaded", () => {
+                const triggerPlayer = setInterval(() => {
+                    // Emulate a standard screen tap in the center where the play button lives
+                    const centerEl = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+                    if (centerEl && centerEl.click) centerEl.click();
+                    
+                    // Force any video tags to initialize network requests
+                    document.querySelectorAll('video').forEach(v => {
+                        v.muted = true;
+                        v.play().catch(() => {});
+                    });
+                }, 1000);
+                
+                // Stop tapping after 20 seconds
+                setTimeout(() => clearInterval(triggerPlayer), 20000);
+            });
+        });
+
+        console.log(`[Sniper] Navigating mobile view to ${targetUrl}`);
         page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
-        // Wait up to 30 seconds for the network to sniff the 1080p link
+        // Wait up to 25 seconds for the network to sniff the 1080p link
         streamUrl = await Promise.race([
             linkPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 30000))
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 25000))
         ]);
 
     } catch (err) {
