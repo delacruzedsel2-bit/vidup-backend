@@ -155,90 +155,72 @@ async function scrapeVidup(targetUrl) {
     const browser = await getBrowser();
     const page = await browser.newPage();
     let streamUrl = null;
-    let isResolved = false; 
 
     try {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-        
         await page.setRequestInterception(true);
+        
         const linkPromise = new Promise((resolve) => {
             page.on('request', (req) => {
                 const u = req.url();
                 const type = req.resourceType();
                 
-                // 1. Abort heavy resources to speed up page load and reduce timeout risk
-                if (['image', 'font', 'stylesheet'].includes(type)) {
+                // 1. SAVE RAM: Block heavy visual resources so Render doesn't choke
+                if (['image', 'stylesheet', 'font'].includes(type)) {
                     req.abort();
                     return;
                 }
 
+                // Catch the target manifest
                 if ((u.includes('.m3u8') || u.includes('.mp4')) && !u.includes('.vtt') && !u.includes('blank') && !u.includes('ad')) {
                     console.log("[Sniper SUCCESS] Live link captured:", u);
-                    isResolved = true;
                     resolve(u);
                 }
                 req.continue();
             });
         });
 
-        // Load the page
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        console.log(`[Sniper] Navigating to ${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
 
-        // 2. Native Puppeteer Interaction Routine
-        const interactWithPage = async () => {
-            await new Promise(r => setTimeout(r, 1500)); // Wait for initial "Getting things ready..." loader
-            
-            for (let i = 0; i < 8; i++) { // Poll continuously until the link is found or timeout hits
-                if (isResolved || page.isClosed()) break;
-                
-                try {
-                    // Send a trusted hardware-level click to the center of the viewport
-                    const viewport = page.viewport();
-                    if (viewport) {
-                        await page.mouse.click(viewport.width / 2, viewport.height / 2);
-                    }
+        // Give the iframes (Turnstile/Player) 3 seconds to inject into the DOM
+        await new Promise(r => setTimeout(r, 3000));
 
-                    // 3. Iterate through all frames to catch nested players or Turnstile
-                    for (const frame of page.frames()) {
-                        
-                        // Defeat Turnstile natively
-                        if (frame.url().includes('cloudflare') || frame.url().includes('turnstile')) {
-                            const cfIframe = await page.$('iframe[src*="cloudflare"], iframe[src*="turnstile"]');
-                            if (cfIframe) {
-                                const box = await cfIframe.boundingBox();
-                                if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-                            }
-                        }
-
-                        // Fallback: Try to trigger video play via JS in each isolated frame context
-                        try {
-                            await frame.evaluate(() => {
-                                const v = document.querySelector('video');
-                                if (v) v.play().catch(() => {});
-                            });
-                        } catch (e) {} 
-                    }
-                } catch (e) {}
-                
-                await new Promise(r => setTimeout(r, 2500)); // Wait between interaction attempts
+        // 2. HARDWARE CLICKS: Bypass Cloudflare Turnstile properly
+        const cfFrame = await page.$('iframe[src*="cloudflare"], iframe[src*="turnstile"]');
+        if (cfFrame) {
+            console.log("[Sniper] Attacking Turnstile...");
+            const box = await cfFrame.boundingBox();
+            if (box) {
+                // page.mouse.click sends hardware-level CDP events (isTrusted: true)
+                await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                await new Promise(r => setTimeout(r, 4000)); // Wait for clearance
             }
-        };
+        }
 
-        // Run interaction asynchronously alongside the listener
-        interactWithPage();
+        // 3. IFRAME PIERCING: Click the dead-center of the screen
+        console.log("[Sniper] Hitting center of the viewport (Player)...");
+        const { width, height } = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+        
+        // Loop clicks with a delay. The first click usually kills the pop-under ad, 
+        // the second/third click triggers the actual player inside the iframe.
+        for(let i = 0; i < 3; i++) {
+             await page.mouse.click(width / 2, height / 2);
+             await new Promise(r => setTimeout(r, 1200));
+        }
 
-        // 25-second limit to grab the link
+        // Final race against the clock
         streamUrl = await Promise.race([
             linkPromise,
             new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 25000))
         ]);
 
     } catch (err) {
-        console.log("[Sniper Timeout]", err.message);
+        console.log("[Sniper Error]", err.message);
     } finally {
-        isResolved = true;
         await page.close().catch(() => {});
     }
+    
     return streamUrl;
 }
 
